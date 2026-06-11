@@ -120,9 +120,16 @@ func (qb *partitionBatcher) consumeInternal(ctx context.Context, req request.Req
 			qb.resetTimer()
 		}
 
+		if isActive {
+			qb.stopWG.Add(len(reqList))
+		}
 		qb.currentBatchMu.Unlock()
 		for i := 0; i < len(reqList); i++ {
-			qb.flush(ctx, reqList[i], done)
+			if isActive {
+				qb.flush(ctx, reqList[i], done)
+			} else {
+				qb.flushSync(ctx, reqList[i], done)
+			}
 		}
 
 		return isActive
@@ -195,20 +202,49 @@ func (qb *partitionBatcher) consumeInternal(ctx context.Context, req request.Req
 		}
 	}
 
+	if isActive {
+		numFlushes := len(reqList)
+		if firstBatch != nil {
+			numFlushes++
+		}
+		qb.stopWG.Add(numFlushes)
+	}
 	qb.currentBatchMu.Unlock()
 	if firstBatch != nil {
-		qb.flush(firstBatch.ctx, firstBatch.req, firstBatch.done)
+		if isActive {
+			qb.flush(firstBatch.ctx, firstBatch.req, firstBatch.done)
+		} else {
+			qb.flushSync(firstBatch.ctx, firstBatch.req, firstBatch.done)
+		}
 	}
 	for i := 0; i < len(reqList); i++ {
-		qb.flush(ctx, reqList[i], done)
+		if isActive {
+			qb.flush(ctx, reqList[i], done)
+		} else {
+			qb.flushSync(ctx, reqList[i], done)
+		}
 	}
 	return isActive
 }
 
 func (qb *partitionBatcher) Consume(ctx context.Context, req request.Request, done queue.Done) {
 	if !qb.consumeInternal(ctx, req, done) {
-		// Not active partition then flush else let the timer/Shutdown do it's work.
-		qb.flushCurrentBatchOrRemovePartition()
+		// Not active partition: the timer goroutine is gone and shutdownInternal may be in
+		// stopWG.Wait, so drain any batch parked by consumeInternal on this goroutine.
+		qb.flushCurrentBatchSync()
+	}
+}
+
+// flushCurrentBatchSync flushes the current batch, if any, synchronously on the caller's
+// goroutine without touching stopWG. Must only be used once the partition is inactive:
+// calling stopWG.Add here could race shutdownInternal's stopWG.Wait.
+func (qb *partitionBatcher) flushCurrentBatchSync() {
+	qb.currentBatchMu.Lock()
+	batchToFlush := qb.currentBatch
+	qb.currentBatch = nil
+	qb.currentBatchMu.Unlock()
+	if batchToFlush != nil {
+		qb.flushSync(batchToFlush.ctx, batchToFlush.req, batchToFlush.done)
 	}
 }
 
@@ -241,10 +277,19 @@ func (qb *partitionBatcher) shutdownInternal() {
 	qb.active = false
 	// don't need to trigger onEmpty during shutdown as partitionBatcher will be purged anyway.
 	qb.onEmpty = nil
+	// Take the last batch while holding the lock and account for its flush in stopWG before
+	// Wait below; once active is false no other goroutine will add to stopWG.
+	batchToFlush := qb.currentBatch
+	qb.currentBatch = nil
+	if batchToFlush != nil {
+		qb.stopWG.Add(1)
+	}
 	qb.currentBatchMu.Unlock()
 	close(qb.shutdownCh)
 	// Make sure execute one last flush if necessary.
-	qb.flushCurrentBatchOrRemovePartition()
+	if batchToFlush != nil {
+		qb.flush(batchToFlush.ctx, batchToFlush.req, batchToFlush.done)
+	}
 	qb.stopWG.Wait()
 }
 
@@ -256,8 +301,15 @@ func (qb *partitionBatcher) Shutdown(context.Context) error {
 
 // flushCurrentBatchOrRemovePartition flushes the current batch if not empty,
 // or removes the partition from the parent if it's been idle for too long.
+// Called only from the timer goroutine.
 func (qb *partitionBatcher) flushCurrentBatchOrRemovePartition() {
 	qb.currentBatchMu.Lock()
+	if !qb.active {
+		// Shutdown already drained the current batch; any batch parked by a late Consume
+		// is drained by that same Consume via flushCurrentBatchSync.
+		qb.currentBatchMu.Unlock()
+		return
+	}
 	if qb.currentBatch == nil {
 		// No data to flush - check if idle for too long AND no one holding a reference
 		idleDuration := time.Since(qb.lastDataTime)
@@ -281,18 +333,30 @@ func (qb *partitionBatcher) flushCurrentBatchOrRemovePartition() {
 	// Reset timer while holding the lock to prevent data race with Consume() which
 	// also calls resetTimer() under the same lock.
 	qb.resetTimer()
+	// Account for the flush while holding the lock with active == true: lock ordering
+	// guarantees this Add happens before shutdownInternal flips active and calls stopWG.Wait.
+	qb.stopWG.Add(1)
 	qb.currentBatchMu.Unlock()
 	// flush() blocks until successfully started a goroutine for flushing.
 	qb.flush(batchToFlush.ctx, batchToFlush.req, batchToFlush.done)
 }
 
-// flush starts a goroutine that calls consumeFunc. It blocks until a worker is available if necessary.
+// flush starts a goroutine that calls consumeFunc. It blocks until a worker is available if
+// necessary. Callers must have already accounted for the flush in stopWG: either while holding
+// currentBatchMu with active == true, or in shutdownInternal before stopWG.Wait. Calling
+// stopWG.Add here, outside the lock, races shutdownInternal's stopWG.Wait.
 func (qb *partitionBatcher) flush(ctx context.Context, req request.Request, done queue.Done) {
-	qb.stopWG.Add(1)
 	qb.wp.execute(func() {
 		defer qb.stopWG.Done()
 		done.OnDone(qb.consumeFunc(ctx, req))
 	})
+}
+
+// flushSync exports the request synchronously on the caller's goroutine without touching
+// stopWG. Used once the partition is inactive, when shutdownInternal may already be in
+// stopWG.Wait.
+func (qb *partitionBatcher) flushSync(ctx context.Context, req request.Request, done queue.Done) {
+	done.OnDone(qb.consumeFunc(ctx, req))
 }
 
 type workerPool struct {

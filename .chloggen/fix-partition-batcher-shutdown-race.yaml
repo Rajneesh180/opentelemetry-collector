@@ -1,0 +1,30 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The name of the component, or a single word describing the area of concern, (e.g. receiver/otlp)
+component: exporterhelper
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Fix WaitGroup misuse panic caused by a race between partition batcher Consume and Shutdown.
+
+# One or more tracking issues or pull requests related to the change
+issues: [15422]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  The partition batcher accounted for in-flight flushes in its WaitGroup outside the batch mutex,
+  so a `Consume` racing with `Shutdown` (or with LRU partition eviction) could call `Add` while
+  `Wait` was running and panic with `sync: WaitGroup is reused before previous Wait has returned`.
+  Flushes are now accounted for under the mutex while the partition is active, and late `Consume`
+  calls on an inactive partition export synchronously without touching the WaitGroup.
+
+# Optional: The change log or logs in which this entry should be included.
+# e.g. '[user]' or '[user, api]'
+# Include 'user' if the change is relevant to end users.
+# Include 'api' if there is a change to a library API.
+# Default: '[user]'
+change_logs: [user]
